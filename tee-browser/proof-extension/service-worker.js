@@ -9,6 +9,77 @@ const KEEPALIVE_ALARM = 'proof-keepalive'
 let currentUserAgent = null
 let pollingActive = false
 
+// CDP network capture, buffered per-navigation, keyed by requestId
+let debuggee = null
+const netRequests = new Map()
+let cdpAttached = false
+
+async function attachDebugger(tabId) {
+  if (cdpAttached && debuggee?.tabId === tabId) return
+  if (cdpAttached) await detachDebugger()
+  debuggee = { tabId }
+  await chrome.debugger.attach(debuggee, '1.3')
+  await chrome.debugger.sendCommand(debuggee, 'Network.enable')
+  cdpAttached = true
+  console.log('[Proof] CDP attached to tab', tabId)
+}
+
+async function detachDebugger() {
+  if (!cdpAttached) return
+  try { await chrome.debugger.detach(debuggee) } catch (e) {}
+  cdpAttached = false
+}
+
+function resetNetLog() {
+  netRequests.clear()
+}
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (!debuggee || source.tabId !== debuggee.tabId) return
+  if (method === 'Network.requestWillBeSent') {
+    const r = params.request
+    netRequests.set(params.requestId, {
+      requestId: params.requestId,
+      type: params.type,
+      method: r.method,
+      url: r.url,
+      request_headers: r.headers,
+      post_data: r.postData || null,
+      has_post_data: !!r.hasPostData,
+      timestamp: params.wallTime
+    })
+  } else if (method === 'Network.responseReceived') {
+    const e = netRequests.get(params.requestId)
+    if (e) {
+      e.type = params.type
+      e.status = params.response.status
+      e.response_headers = params.response.headers
+      e.mime_type = params.response.mimeType
+    }
+  } else if (method === 'Network.loadingFinished') {
+    const e = netRequests.get(params.requestId)
+    if (e) e.finished = true
+  }
+})
+
+async function fetchBodies() {
+  const out = []
+  for (const e of netRequests.values()) {
+    const wantBody = e.type === 'XHR' || e.type === 'Fetch' ||
+      (e.mime_type && (e.mime_type.includes('json') || e.mime_type.includes('javascript')))
+    if (wantBody && e.finished) {
+      try {
+        const b = await chrome.debugger.sendCommand(debuggee, 'Network.getResponseBody', { requestId: e.requestId })
+        e.response_body = b.base64Encoded ? '[base64]' + b.body : b.body
+      } catch (err) {
+        e.response_body_error = err.message
+      }
+    }
+    out.push(e)
+  }
+  return out
+}
+
 console.log('[Proof] Service worker starting...')
 
 // Poll bridge for commands
@@ -68,6 +139,9 @@ async function executeCommand(cmd) {
       case 'eval':
         result = await evalScript(cmd.args)
         break
+      case 'captureTrace':
+        result = await captureTrace()
+        break
       case 'getLoggedInUser':
         result = await getLoggedInUser(cmd.args?.tabId)
         break
@@ -96,25 +170,35 @@ async function injectSession({ cookies, userAgent }) {
   console.log('[Proof] Injecting session:', cookies?.length, 'cookies')
 
   // Inject cookies
+  let set = 0, failed = 0
   if (cookies?.length) {
+    // chrome.cookies.set only accepts these sameSite values; "None"/"Strict"/"Lax"
+    // (the standard Set-Cookie spellings) are INVALID and reject the whole cookie.
+    const SS = { none: 'no_restriction', no_restriction: 'no_restriction', lax: 'lax', strict: 'strict', unspecified: 'unspecified' }
     for (const cookie of cookies) {
       try {
         const url = `http${cookie.secure ? 's' : ''}://${cookie.domain.replace(/^\./, '')}${cookie.path || '/'}`
+        const secure = !!cookie.secure
+        let sameSite = SS[String(cookie.sameSite || '').toLowerCase()] || 'lax'
+        if (sameSite === 'no_restriction' && !secure) sameSite = 'lax' // Chrome rejects SameSite=None without Secure
         await chrome.cookies.set({
           url,
           name: cookie.name,
           value: cookie.value,
           domain: cookie.domain,
           path: cookie.path || '/',
-          secure: !!cookie.secure,
+          secure,
           httpOnly: !!cookie.httpOnly,
-          sameSite: cookie.sameSite || 'lax',
+          sameSite,
           expirationDate: cookie.expirationDate || cookie.expires || (Date.now() / 1000 + 86400)
         })
+        set++
       } catch (e) {
+        failed++
         console.warn('[Proof] Failed to set cookie:', cookie.name, e.message)
       }
     }
+    console.log(`[Proof] cookies set ${set}, failed ${failed}`)
   }
 
   // Set user agent via declarativeNetRequest
@@ -123,7 +207,7 @@ async function injectSession({ cookies, userAgent }) {
     await updateUserAgentRule(userAgent)
   }
 
-  return { cookiesSet: cookies?.length || 0, userAgent: !!userAgent }
+  return { cookiesSet: set, cookiesFailed: failed, userAgent: !!userAgent }
 }
 
 // Update UA spoofing rule
@@ -160,29 +244,38 @@ async function updateUserAgentRule(userAgent) {
 }
 
 // Navigate to URL
-async function navigate({ url }) {
-  console.log('[Proof] Navigating to:', url)
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-
-  if (tab) {
-    await chrome.tabs.update(tab.id, { url })
-  } else {
-    await chrome.tabs.create({ url })
-  }
-
-  // Wait for load
-  await new Promise(resolve => {
-    const listener = (tabId, info) => {
-      if (info.status === 'complete') {
+function waitForComplete(tabId, timeout = 15000) {
+  return new Promise(resolve => {
+    const listener = (id, info) => {
+      if (id === tabId && info.status === 'complete') {
         chrome.tabs.onUpdated.removeListener(listener)
         resolve()
       }
     }
     chrome.tabs.onUpdated.addListener(listener)
-    setTimeout(resolve, 10000) // timeout
+    setTimeout(resolve, timeout)
   })
+}
 
-  return { success: true, url }
+async function navigate({ url }) {
+  console.log('[Proof] Navigating to:', url)
+  let [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+  if (!tab) tab = await chrome.tabs.create({ url: 'about:blank' })
+
+  // Debugger can't attach to chrome:// pages — route through about:blank first
+  if (!tab.url || tab.url.startsWith('chrome:') || tab.url.startsWith('chrome-extension:')) {
+    await chrome.tabs.update(tab.id, { url: 'about:blank' })
+    await waitForComplete(tab.id, 5000)
+  }
+
+  await attachDebugger(tab.id)
+  resetNetLog()
+  await chrome.tabs.update(tab.id, { url })
+  await waitForComplete(tab.id)
+  // settle: let late XHR/fetch (e.g. gql/svc) land in the buffer
+  await new Promise(r => setTimeout(r, 3000))
+
+  return { success: true, url, capturedRequests: netRequests.size }
 }
 
 // Take screenshot
@@ -222,6 +315,24 @@ async function captureProof() {
     title: tab?.title,
     pageInfo
   }
+}
+
+// Capture full trace: screenshot + rendered DOM + network log (with bodies)
+async function captureTrace() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+  if (!tab?.id) throw new Error('No active tab')
+
+  const screenshot = await chrome.tabs.captureVisibleTab({ format: 'png' })
+
+  const domResults = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: () => document.documentElement.outerHTML
+  })
+  const dom_html = domResults[0]?.result || ''
+
+  const network_log = await fetchBodies()
+
+  return { screenshot, dom_html, url: tab.url, title: tab.title, network_log }
 }
 
 // Get logged-in user from Twitter's authenticated page
