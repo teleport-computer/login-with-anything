@@ -3,7 +3,7 @@
  * Polls bridge for commands, injects cookies, captures screenshots
  */
 
-const BRIDGE_URL = 'http://localhost:3000'
+const BRIDGE_URL = 'http://127.0.0.1:3001' // loopback-only channel; the public port does not serve /api/commands
 const KEEPALIVE_ALARM = 'proof-keepalive'
 
 let currentUserAgent = null
