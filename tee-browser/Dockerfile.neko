@@ -1,7 +1,19 @@
 # Proof Browser Container
 # Chromium with proof extension pre-loaded
 
-FROM ghcr.io/m1k1o/neko/chromium:latest
+# PINNED so the base cannot move under us: building from :latest silently shifted Chromium
+# 143 -> 146 on 2026-07-21. Pin it, but do not blame it —
+#
+# CORRECTION (measured 2026-07-21; this comment previously asserted the opposite as fact):
+# the Chromium version did NOT break chrome.scripting.executeScript. The null /eval and empty
+# captureProof.pageInfo came from prod's egress VPN dying. Chromium honors the ALL_PROXY the
+# daemon injects for egress:true projects; the proxy stopped forwarding; every navigation landed
+# on a network-error page; and executeScript refuses to inject into error pages. Screenshots
+# survived because captureVisibleTab captures the composited frame regardless.
+# Proven by running THIS image both ways locally: working network -> real text; dead SOCKS proxy
+# -> byte-identical prod symptom. If text extraction breaks again, screenshot the browser and look
+# at the page BEFORE suspecting the image.
+FROM ghcr.io/m1k1o/neko/chromium:3.0.10
 
 # Install Node.js for bridge
 RUN apt-get update && apt-get install -y nodejs && rm -rf /var/lib/apt/lists/*

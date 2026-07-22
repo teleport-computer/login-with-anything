@@ -211,6 +211,17 @@ const server = http.createServer(async (req, res) => {
     try {
       const { script } = JSON.parse(body)
       const result = await sendCommand('eval', { script })
+      // Surface the extension's failure instead of swallowing it. Returning bare `result.result`
+      // rendered every extension-side throw as a literal `null` body with HTTP 200: the caller
+      // could not tell "the page had no text" from "executeScript threw". A dead egress proxy put
+      // the browser on a Chromium error page (executeScript refuses to inject into those) and the
+      // resulting null was misread for a day as a Chromium regression, an edit bug and manifest
+      // drift, none of which it was. The error string said so all along.
+      if (!result.success) {
+        res.writeHead(502, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: result.error || 'eval failed in extension' }))
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result.result))
     } catch (e) {

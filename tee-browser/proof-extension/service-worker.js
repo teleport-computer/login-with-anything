@@ -212,7 +212,10 @@ async function captureProof() {
       })
       pageInfo = results[0]?.result || {}
     } catch (e) {
+      // Record WHY, don't return a bare {}. executeScript throws on Chromium error pages, so an
+      // egress outage is indistinguishable from a genuinely empty page unless the reason survives.
       console.warn('[Proof] Failed to get page info:', e)
+      pageInfo = { error: e.message }
     }
   }
 
