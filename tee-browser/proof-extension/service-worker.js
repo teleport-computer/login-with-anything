@@ -8,6 +8,7 @@ const KEEPALIVE_ALARM = 'proof-keepalive'
 
 let currentUserAgent = null
 let pollingActive = false
+let ourTab = null // the tab /navigate opened; /eval reads this one, never "whichever is active"
 
 console.log('[Proof] Service worker starting...')
 
@@ -18,6 +19,7 @@ async function pollOnce() {
     if (res.ok) {
       const commands = await res.json()
       for (const cmd of commands) {
+        if (Date.now() >= cmd.deadline) continue // the bridge already answered it as timed out
         console.log('[Proof] Command:', cmd.tool)
         await executeCommand(cmd)
       }
@@ -50,34 +52,23 @@ chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.4 })
 // Execute command and send response
 async function executeCommand(cmd) {
   let result = null, success = true, error = ''
-
+  let timer
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${cmd.tool} timed out`)), cmd.deadline - Date.now())
+  })
   try {
-    switch (cmd.tool) {
-      case 'injectSession':
-        result = await injectSession(cmd.args)
-        break
-      case 'navigate':
-        result = await navigate(cmd.args)
-        break
-      case 'screenshot':
-        result = await screenshot()
-        break
-      case 'captureProof':
-        result = await captureProof()
-        break
-      case 'eval':
-        result = await evalScript(cmd.args)
-        break
-      case 'getLoggedInUser':
-        result = await getLoggedInUser(cmd.args?.tabId)
-        break
-      default:
-        throw new Error(`Unknown command: ${cmd.tool}`)
-    }
+    result = await Promise.race([runCommand(cmd), expired])
   } catch (e) {
     success = false
     error = e.message
+    if (Date.now() >= cmd.deadline && ourTab !== null) {
+      // Abandon for real: closing the tab aborts its load and any hung executeScript in it.
+      const tab = ourTab
+      ourTab = null
+      await chrome.tabs.remove(tab)
+    }
   }
+  clearTimeout(timer)
 
   // Send response
   try {
@@ -88,6 +79,18 @@ async function executeCommand(cmd) {
     })
   } catch (e) {
     console.error('[Proof] Failed to send response:', e)
+  }
+}
+
+function runCommand(cmd) {
+  switch (cmd.tool) {
+    case 'injectSession': return injectSession(cmd.args)
+    case 'navigate': return navigate(cmd.args)
+    case 'screenshot': return screenshot()
+    case 'captureProof': return captureProof()
+    case 'eval': return evalScript(cmd.args)
+    case 'getLoggedInUser': return getLoggedInUser(cmd.args?.tabId)
+    default: throw new Error(`Unknown command: ${cmd.tool}`)
   }
 }
 
@@ -160,29 +163,47 @@ async function updateUserAgentRule(userAgent) {
 }
 
 // Navigate to URL
+// Each navigate gets a fresh tab, so every main-frame event on it belongs to this navigation, and
+// the previous tab (with anything still running in it) is closed. Resolves on this tab's load of
+// the URL with the main frame's HTTP status and final URL; if the load event has not fired 10 s
+// after the main-frame response, resolves with loaded: false.
 async function navigate({ url }) {
   console.log('[Proof] Navigating to:', url)
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+  const previous = ourTab
+  const tab = await chrome.tabs.create({ url: 'about:blank', active: true })
+  ourTab = tab.id
+  if (previous !== null) await chrome.tabs.remove(previous)
+  const loading = loadOf(tab.id)
+  await chrome.tabs.update(tab.id, { url })
+  return { success: true, url, ...(await loading) }
+}
 
-  if (tab) {
-    await chrome.tabs.update(tab.id, { url })
-  } else {
-    await chrome.tabs.create({ url })
-  }
-
-  // Wait for load
-  await new Promise(resolve => {
-    const listener = (tabId, info) => {
-      if (info.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(listener)
-        resolve()
-      }
+function loadOf(tabId) {
+  return new Promise((resolve, reject) => {
+    const filter = { urls: ['<all_urls>'], tabId, types: ['main_frame'] }
+    let response = null, settle
+    const finish = (fn, value) => {
+      clearTimeout(settle)
+      chrome.webRequest.onCompleted.removeListener(onCompleted)
+      chrome.webRequest.onErrorOccurred.removeListener(onError)
+      chrome.tabs.onUpdated.removeListener(onUpdated)
+      chrome.tabs.onRemoved.removeListener(onRemoved)
+      fn(value)
     }
-    chrome.tabs.onUpdated.addListener(listener)
-    setTimeout(resolve, 10000) // timeout
+    const onCompleted = d => {
+      response = { status: d.statusCode, finalUrl: d.url }
+      clearTimeout(settle)
+      settle = setTimeout(() => finish(resolve, { ...response, loaded: false }), 10000)
+      chrome.tabs.get(tabId).then(t => { if (t.status === 'complete') finish(resolve, { ...response, loaded: true }) })
+    }
+    const onError = d => finish(reject, new Error(`${d.error} loading ${d.url}`))
+    const onUpdated = (id, info) => { if (id === tabId && info.status === 'complete' && response) finish(resolve, { ...response, loaded: true }) }
+    const onRemoved = id => { if (id === tabId) finish(reject, new Error('tab closed during navigation')) }
+    chrome.webRequest.onCompleted.addListener(onCompleted, filter)
+    chrome.webRequest.onErrorOccurred.addListener(onError, filter)
+    chrome.tabs.onUpdated.addListener(onUpdated)
+    chrome.tabs.onRemoved.addListener(onRemoved)
   })
-
-  return { success: true, url }
 }
 
 // Take screenshot
@@ -273,11 +294,11 @@ async function getLoggedInUser(tabId) {
 
 // Extract structured data from page — returns full body text + JSON if available
 async function evalScript({ script }) {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-  if (!tab?.id) throw new Error('No active tab')
+  // `script` is not run: MV3 forbids evaluating a string in the extension, so this always extracts.
+  if (ourTab === null) throw new Error('No page: call /navigate first')
 
   const results = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId: ourTab },
     func: () => {
       const text = document.body?.innerText || ''
       // Try parsing as JSON (e.g. Reddit /about.json endpoints)

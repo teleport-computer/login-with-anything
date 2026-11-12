@@ -161,12 +161,17 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/navigate' && req.method === 'POST') {
     const body = await readBody(req)
     try {
-      const { url: targetUrl } = JSON.parse(body)
-      const result = await sendCommand('navigate', { url: targetUrl })
+      const { url: targetUrl, timeout_ms } = JSON.parse(body)
+      const result = await sendCommand('navigate', { url: targetUrl }, timeout_ms)
+      if (!result.success) {
+        res.writeHead(502, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: result.error }))
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result))
     } catch (e) {
-      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.writeHead(e instanceof CommandTimeout ? 504 : 400, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: e.message }))
     }
     return
@@ -209,8 +214,8 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/eval' && req.method === 'POST') {
     const body = await readBody(req)
     try {
-      const { script } = JSON.parse(body)
-      const result = await sendCommand('eval', { script })
+      const { script, timeout_ms } = JSON.parse(body)
+      const result = await sendCommand('eval', { script }, timeout_ms)
       // Surface the extension's failure instead of swallowing it. Returning bare `result.result`
       // rendered every extension-side throw as a literal `null` body with HTTP 200: the caller
       // could not tell "the page had no text" from "executeScript threw". A dead egress proxy put
@@ -225,7 +230,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result.result))
     } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.writeHead(e instanceof CommandTimeout ? 504 : 500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: e.message }))
     }
     return
@@ -308,13 +313,19 @@ function readBody(req) {
   })
 }
 
+// A command carries its deadline to the extension, which drops it if it arrives late and abandons
+// it (closing the tab it was driving) when it runs past. An abandoned command never runs later.
+class CommandTimeout extends Error {}
 let commandId = 0
 function sendCommand(tool, args, timeout = 30000) {
   return new Promise((resolve, reject) => {
     const id = `cmd-${++commandId}`
+    const deadline = Date.now() + timeout
     const timer = setTimeout(() => {
       pendingCommands.delete(id)
-      reject(new Error(`Command ${tool} timed out`))
+      const queued = commandQueue.findIndex(c => c.id === id)
+      if (queued >= 0) commandQueue.splice(queued, 1)
+      reject(new CommandTimeout(`Command ${tool} timed out after ${timeout} ms`))
     }, timeout)
 
     pendingCommands.set(id, {
@@ -324,7 +335,7 @@ function sendCommand(tool, args, timeout = 30000) {
       }
     })
 
-    commandQueue.push({ id, tool, args })
+    commandQueue.push({ id, tool, args, deadline })
     console.log('[Bridge] Queued:', tool, id)
   })
 }
