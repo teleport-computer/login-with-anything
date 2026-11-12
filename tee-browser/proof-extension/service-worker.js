@@ -165,8 +165,8 @@ async function updateUserAgentRule(userAgent) {
 // Navigate to URL
 // Each navigate gets a fresh tab, so every main-frame event on it belongs to this navigation, and
 // the previous tab (with anything still running in it) is closed. Resolves on this tab's load of
-// the URL with the main frame's HTTP status and final URL; if the load event has not fired 10 s
-// after the main-frame response, resolves with loaded: false.
+// the URL with the main frame's HTTP status and the tab's final URL; if the load event has not
+// fired 10 s after the main-frame response, resolves with loaded: false.
 async function navigate({ url }) {
   console.log('[Proof] Navigating to:', url)
   const previous = ourTab
@@ -181,7 +181,7 @@ async function navigate({ url }) {
 function loadOf(tabId) {
   return new Promise((resolve, reject) => {
     const filter = { urls: ['<all_urls>'], tabId, types: ['main_frame'] }
-    let response = null, settle
+    let response = { status: null, finalUrl: null }, started = false, settle
     const finish = (fn, value) => {
       clearTimeout(settle)
       chrome.webRequest.onCompleted.removeListener(onCompleted)
@@ -190,14 +190,22 @@ function loadOf(tabId) {
       chrome.tabs.onRemoved.removeListener(onRemoved)
       fn(value)
     }
+    const loaded = t => finish(resolve, { status: response.status, finalUrl: t.url, loaded: true })
     const onCompleted = d => {
       response = { status: d.statusCode, finalUrl: d.url }
+      started = true
       clearTimeout(settle)
       settle = setTimeout(() => finish(resolve, { ...response, loaded: false }), 10000)
-      chrome.tabs.get(tabId).then(t => { if (t.status === 'complete') finish(resolve, { ...response, loaded: true }) })
+      chrome.tabs.get(tabId).then(t => { if (t.status === 'complete' && t.url !== 'about:blank') loaded(t) })
     }
-    const onError = d => finish(reject, new Error(`${d.error} loading ${d.url}`))
-    const onUpdated = (id, info) => { if (id === tabId && info.status === 'complete' && response) finish(resolve, { ...response, loaded: true }) }
+    // ERR_ABORTED: the request was replaced (go.dev aborts every main-frame request and still
+    // loads), so keep waiting for the tab; the command deadline bounds it. Status stays null.
+    const onError = d => { if (d.error !== 'net::ERR_ABORTED') finish(reject, new Error(`${d.error} loading ${d.url}`)) }
+    const onUpdated = (id, info, t) => {
+      if (id !== tabId || t.url === 'about:blank') return
+      if (info.status === 'loading') started = true
+      if (info.status === 'complete' && started) loaded(t)
+    }
     const onRemoved = id => { if (id === tabId) finish(reject, new Error('tab closed during navigation')) }
     chrome.webRequest.onCompleted.addListener(onCompleted, filter)
     chrome.webRequest.onErrorOccurred.addListener(onError, filter)
@@ -299,6 +307,7 @@ async function evalScript({ script }) {
 
   const results = await chrome.scripting.executeScript({
     target: { tabId: ourTab },
+    injectImmediately: true, // don't wait for document_idle, which a page still loading never reaches
     func: () => {
       const text = document.body?.innerText || ''
       // Try parsing as JSON (e.g. Reddit /about.json endpoints)
