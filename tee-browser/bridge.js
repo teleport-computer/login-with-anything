@@ -14,6 +14,11 @@ const fs = require('fs')
 const path = require('path')
 
 const PORT = process.env.BRIDGE_PORT || 3000
+// The extension's command channel listens HERE, bound to loopback only, and is deliberately not
+// served on PORT. Source-IP checks cannot separate "inside the container" from "the internet"
+// on every topology (see BRIDGE_TRUST_LOCAL below), but a socket bound to 127.0.0.1 that no
+// gateway maps is unreachable from outside no matter what an attacker claims to be.
+const INTERNAL_PORT = process.env.BRIDGE_INTERNAL_PORT || 3001
 const ARTIFACTS_DIR = '/tmp/proof-artifacts'
 
 // Ensure artifacts dir exists
@@ -23,6 +28,33 @@ if (!fs.existsSync(ARTIFACTS_DIR)) fs.mkdirSync(ARTIFACTS_DIR, { recursive: true
 let currentSession = null
 const commandQueue = []
 const pendingCommands = new Map()
+
+// --- Auth. The bridge is reachable over the public gateway, so every control endpoint
+// (/session, /navigate, /eval, /screenshot, …) requires a shared secret that only the OAuth3 pod
+// knows. Fail closed: if BRIDGE_SECRET is unset, control endpoints refuse rather than run wide
+// open. The extension's polling channel is not served here at all — it has its own loopback-only
+// listener on INTERNAL_PORT.
+const BRIDGE_SECRET = process.env.BRIDGE_SECRET || ''
+function isLoopback(req) {
+  const a = req.socket.remoteAddress || ''
+  return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1'
+}
+// Trusting the SOURCE IP is only sound where external traffic cannot arrive wearing one. On the
+// Phala CVM it cannot: gateway traffic is SNAT'd to a docker-bridge address, so the private
+// lwa-net (17.100.0.0/16) genuinely means "same CVM". Behind the dstack daemon it CAN: that proxy
+// reaches the container over loopback, so every request from the internet arrives as 127.0.0.1,
+// this check returned true for all of them, and fail-closed silently became fail-open. Same code,
+// opposite security property, decided entirely by deployment topology — so it is now OFF unless a
+// deployment explicitly asserts its network makes the check meaningful.
+const TRUST_LOCAL = process.env.BRIDGE_TRUST_LOCAL === '1'
+function isInternal(req) {
+  if (!TRUST_LOCAL) return false
+  const a = (req.socket.remoteAddress || '').replace('::ffff:', '')
+  return isLoopback(req) || a.startsWith('17.100.')
+}
+function bearerOk(req) {
+  return !!BRIDGE_SECRET && (req.headers['authorization'] || '') === `Bearer ${BRIDGE_SECRET}`
+}
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
@@ -37,15 +69,43 @@ const server = http.createServer(async (req, res) => {
 
   const url = new URL(req.url, `http://localhost:${PORT}`)
 
-  // Health check
+  // Health check — liveness only, no session details, no auth.
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({
-      status: 'ok',
-      session: currentSession ? { userAgent: currentSession.userAgent?.slice(0, 50) + '...', cookieCount: currentSession.cookies?.length } : null,
-      pendingCommands: commandQueue.length
-    }))
+    res.end(JSON.stringify({ status: 'ok' }))
     return
+  }
+
+  // --- auth gate ---
+  // The extension channel is served ONLY by the loopback-bound internal listener. Refusing it
+  // here means that even if this port is exposed, the command queue cannot be read or answered
+  // from outside — previously a loopback-looking proxy could poll and inject on it freely.
+  if (req.socket.localPort != INTERNAL_PORT &&
+      (url.pathname === '/api/commands' || url.pathname === '/api/responses')) {
+    res.writeHead(404, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'not found' }))
+    return
+  }
+  if (url.pathname === '/api/commands' || url.pathname === '/api/responses') {
+    // internal extension polling channel — localhost only
+    if (!isLoopback(req)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'forbidden (loopback only)' }))
+      return
+    }
+  } else if (!isInternal(req)) {
+    // external control endpoints require the shared secret (fail closed if unset).
+    // Same-CVM (lwa-net) + loopback callers are trusted and skip it.
+    if (!BRIDGE_SECRET) {
+      res.writeHead(503, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'BRIDGE_SECRET not configured' }))
+      return
+    }
+    if (!bearerOk(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'unauthorized' }))
+      return
+    }
   }
 
   // Extension polls for commands
@@ -101,12 +161,17 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/navigate' && req.method === 'POST') {
     const body = await readBody(req)
     try {
-      const { url: targetUrl } = JSON.parse(body)
-      const result = await sendCommand('navigate', { url: targetUrl })
+      const { url: targetUrl, timeout_ms } = JSON.parse(body)
+      const result = await sendCommand('navigate', { url: targetUrl }, timeout_ms)
+      if (!result.success) {
+        res.writeHead(502, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: result.error }))
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result))
     } catch (e) {
-      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.writeHead(e instanceof CommandTimeout ? 504 : 400, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: e.message }))
     }
     return
@@ -149,12 +214,23 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/eval' && req.method === 'POST') {
     const body = await readBody(req)
     try {
-      const { script } = JSON.parse(body)
-      const result = await sendCommand('eval', { script })
+      const { script, timeout_ms } = JSON.parse(body)
+      const result = await sendCommand('eval', { script }, timeout_ms)
+      // Surface the extension's failure instead of swallowing it. Returning bare `result.result`
+      // rendered every extension-side throw as a literal `null` body with HTTP 200: the caller
+      // could not tell "the page had no text" from "executeScript threw". A dead egress proxy put
+      // the browser on a Chromium error page (executeScript refuses to inject into those) and the
+      // resulting null was misread for a day as a Chromium regression, an edit bug and manifest
+      // drift, none of which it was. The error string said so all along.
+      if (!result.success) {
+        res.writeHead(502, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: result.error || 'eval failed in extension' }))
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(result.result))
     } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.writeHead(e instanceof CommandTimeout ? 504 : 500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: e.message }))
     }
     return
@@ -237,13 +313,19 @@ function readBody(req) {
   })
 }
 
+// A command carries its deadline to the extension, which drops it if it arrives late and abandons
+// it (closing the tab it was driving) when it runs past. An abandoned command never runs later.
+class CommandTimeout extends Error {}
 let commandId = 0
 function sendCommand(tool, args, timeout = 30000) {
   return new Promise((resolve, reject) => {
     const id = `cmd-${++commandId}`
+    const deadline = Date.now() + timeout
     const timer = setTimeout(() => {
       pendingCommands.delete(id)
-      reject(new Error(`Command ${tool} timed out`))
+      const queued = commandQueue.findIndex(c => c.id === id)
+      if (queued >= 0) commandQueue.splice(queued, 1)
+      reject(new CommandTimeout(`Command ${tool} timed out after ${timeout} ms`))
     }, timeout)
 
     pendingCommands.set(id, {
@@ -253,12 +335,20 @@ function sendCommand(tool, args, timeout = 30000) {
       }
     })
 
-    commandQueue.push({ id, tool, args })
+    commandQueue.push({ id, tool, args, deadline })
     console.log('[Bridge] Queued:', tool, id)
   })
 }
 
+// Same handler, second socket: bound to 127.0.0.1 so nothing outside the container can connect,
+// and it is the only listener that serves /api/commands + /api/responses. Gateways map PORT only.
+const internalServer = http.createServer(server.listeners('request')[0])
+internalServer.listen(INTERNAL_PORT, '127.0.0.1', () => {
+  console.log(`[Bridge] Extension channel (loopback only) on 127.0.0.1:${INTERNAL_PORT}`)
+})
+
 server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[Bridge] auth: secret ${BRIDGE_SECRET ? 'SET' : 'MISSING (control endpoints refuse)'}, trust-local ${TRUST_LOCAL ? 'ON' : 'off'}`)
   console.log(`[Bridge] Proof bridge listening on port ${PORT}`)
   console.log(`[Bridge] Health: http://localhost:${PORT}/health`)
   console.log(`[Bridge] Session: POST http://localhost:${PORT}/session`)

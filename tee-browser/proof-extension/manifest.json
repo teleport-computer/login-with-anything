@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Proof Generator",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Injects cookies and captures proof via API interception",
   "permissions": [
     "tabs",
@@ -10,7 +10,8 @@
     "storage",
     "alarms",
     "declarativeNetRequest",
-    "declarativeNetRequestWithHostAccess"
+    "declarativeNetRequestWithHostAccess",
+    "webRequest"
   ],
   "host_permissions": [
     "<all_urls>"
