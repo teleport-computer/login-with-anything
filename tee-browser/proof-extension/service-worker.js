@@ -198,8 +198,9 @@ function loadOf(tabId) {
       settle = setTimeout(() => finish(resolve, { ...response, loaded: false }), 10000)
       chrome.tabs.get(tabId).then(t => { if (t.status === 'complete' && t.url !== 'about:blank') loaded(t) })
     }
-    // ERR_ABORTED: the request was replaced (go.dev aborts every main-frame request and still
-    // loads), so keep waiting for the tab; the command deadline bounds it. Status stays null.
+    // ERR_ABORTED means this request was replaced, not that the page failed: go.dev shows an
+    // aborted main-frame request followed by one that completes. Keep waiting for the tab (the
+    // command deadline bounds it); status is null only if no main-frame request completes.
     const onError = d => { if (d.error !== 'net::ERR_ABORTED') finish(reject, new Error(`${d.error} loading ${d.url}`)) }
     const onUpdated = (id, info, t) => {
       if (id !== tabId || t.url === 'about:blank') return
